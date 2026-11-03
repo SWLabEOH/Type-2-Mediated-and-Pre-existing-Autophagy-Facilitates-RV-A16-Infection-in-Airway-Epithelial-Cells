@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# Pipeline Step 2: Read Alignment & BAM Sorting (HISAT2 & SAMtools)
+# Sample ID: B11
+# Software: HISAT2 (v2.2.1), SAMtools (v1.22.1)
+# Description: Aligns trimmed paired-end reads to GRCh38/hg38 human reference 
+#              genome, sorts/indexes BAM files, and computes alignment metrics.
+# ==============================================================================
+
+# Define base directories (modify according to your local environment)
+REF_GENOME="my_path_to_hg38_index/genome"
+DATA_DIR="my_path_to_data"
+
+# ------------------------------------------------------------------------------
+# STEP 2.1: HISAT2 Alignment piped directly into SAMtools Sort
+# ------------------------------------------------------------------------------
+hisat2 \
+  --dta \
+  -p 20 \
+  -x "${REF_GENOME}" \
+  -1 "${DATA_DIR}/B11o1.fq.gz" \
+  -2 "${DATA_DIR}/B11O2.fq.gz" | \
+samtools sort \
+  -@ 20 \
+  -o "${DATA_DIR}/B11aligned_sorted.bam"
+
+# ------------------------------------------------------------------------------
+# STEP 2.2: Index BAM File and Compute Quality Alignment Statistics
+# ------------------------------------------------------------------------------
+samtools index \
+  -@ 20 \
+  "${DATA_DIR}/B11aligned_sorted.bam"
+
+samtools flagstat \
+  -@ 20 \
+  "${DATA_DIR}/B11aligned_sorted.bam" > "${DATA_DIR}/B11_alignment_stats.txt"

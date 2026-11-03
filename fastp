@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# Pipeline Step 1: Quality Control and Adapter Trimming (fastp)
+# Sample ID: B11
+# Software: fastp (v1.0.1)
+# Description: Paired-end fastp execution for primary airway transcriptomics.
+# ==============================================================================
+
+# Define base directory (modify according to your local environment)
+DATA_DIR="my_path_to_data"
+
+fastp \
+  -i "${DATA_DIR}/B11_1.fq.gz" \
+  -I "${DATA_DIR}/B11_2.fq.gz" \
+  -o "${DATA_DIR}/B11o1.fq.gz" \
+  -O "${DATA_DIR}/B11O2.fq.gz" \
+  -h "${DATA_DIR}/B11_fastp.html" \
+  -j "${DATA_DIR}/B11_fastp.json" \
+  -w 20 -q 20 -l 30 -g -x -5 -3

@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# Pipeline Step 3: Gene-Level Read Quantification (SAMtools & HTSeq)
+# Sample ID: B11
+# Software: SAMtools (v1.22.1), HTSeq (v2.0.9)
+# Annotation: GENCODE v46 (Human GRCh38)
+# Description: Filters aligned BAM for autosomal chromosomes (chr1-chr22) 
+#              and quantifies gene-level exon counts using htseq-count.
+# ==============================================================================
+
+# Define base paths (modify according to your local environment)
+GTF_ANNOTATION="my_path_to_annotation/gencode.v46.annotation.gtf"
+BAM_FILE="my_path_to_data/B11aligned_sorted.bam"
+OUTPUT_TSV="my_path_to_output/B11htseq1to22_counts.tsv"
+
+# ------------------------------------------------------------------------------
+# STEP 3.1: Stream Autosomal Reads (chr1-chr22) directly to htseq-count
+# ------------------------------------------------------------------------------
+samtools view -@ 4 -h "${BAM_FILE}" $(seq -f "chr%g" 1 22) | \
+htseq-count \
+  -f sam \
+  -r pos \
+  -s no \
+  -t exon \
+  -i gene_id \
+  - \
+  "${GTF_ANNOTATION}" > "${OUTPUT_TSV}"

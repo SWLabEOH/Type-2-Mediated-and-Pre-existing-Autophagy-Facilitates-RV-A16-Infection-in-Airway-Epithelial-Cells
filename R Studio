@@ -1,0 +1,1671 @@
+# ==============================================================================
+# PRE-PART 0: RAW HTSEQ COUNT MATRIX ASSEMBLY & CLEANING
+# Pipeline: Primary Human Airway Epithelial Cell Transcriptomics
+# Software: R (v4.0+), tidyverse, fs
+# Description: 
+#   1. Locates individual sample HTSeq count files recursively.
+#   2. Imports counts while stripping HTSeq summary metrics (e.g., _no_feature).
+#   3. Merges samples into a unified matrix, imputing 0s for missing features.
+#   4. Exports the combined raw count matrix.
+# ==============================================================================
+
+library(tidyverse)
+library(fs)
+
+# ------------------------------------------------------------------------------
+# STEP 1: Set Working Directory & Locate Raw HTSeq .tsv Files
+# ------------------------------------------------------------------------------
+# Set execution working directory environment (adjust path as needed)
+# setwd("path/to/your/folder")
+
+# Find and locate all raw HTSeq .tsv files
+files <- dir_ls("folder", recurse = TRUE, glob = "*.tsv")
+sample_names <- path_ext_remove(path_file(files))
+
+# ------------------------------------------------------------------------------
+# STEP 2: Iteratively Read Files and Clean HTSeq Summary Statistics
+# ------------------------------------------------------------------------------
+count_data <- map2(files, sample_names, function(file_path, sample) {
+  read_tsv(file_path, col_names = c("Gene", sample), col_types = "ci") %>%
+    filter(!str_starts(Gene, "_"))  # Strips out _no_feature, _ambiguous, etc.
+}) 
+
+# ------------------------------------------------------------------------------
+# STEP 3: Merge Samples and Handle Structural Layout
+# ------------------------------------------------------------------------------
+gene_matrix <- reduce(count_data, full_join, by = "Gene") %>%
+  mutate(across(where(is.numeric), ~replace_na(., 0))) %>%
+  column_to_rownames("Gene")
+
+# ------------------------------------------------------------------------------
+# STEP 4: Save Raw Combined Matrix
+# ------------------------------------------------------------------------------
+gene_matrix %>% 
+  rownames_to_column("Gene") %>% 
+  write_tsv("gene_count_matrix.tsv")
+
+message("PRE-PART 0 COMPLETE: Raw count matrix successfully assembled and exported as 'gene_count_matrix.tsv'!\n")
+
+
+
+
+# ==============================================================================
+# PART 0: GENE COUNT FILTERING USING edgeR::filterByExpr()
+# Pipeline: Primary Human Airway Epithelial Cell Transcriptomics
+# Software: R (v4.0+), edgeR, tidyverse
+# Description: Constructs DGEList, applies TMM normalization, and filters low-expressed genes using filterByExpr() under a paired (~ Plate + Condition) design.
+# ==============================================================================
+
+library(tidyverse)
+library(edgeR)
+
+# ------------------------------------------------------------------------------
+# STEP 1: Load Data & Define Experimental Metadata
+# ------------------------------------------------------------------------------
+# Load raw count matrix (assumes gene names are in the first column or rownames)
+raw_counts <- read_tsv("gene_count_matrix.tsv") %>%
+  column_to_rownames(var = colnames(.)[1])
+
+# Define experimental design metadata
+metadata <- data.frame(
+  Sample    = c("B11", "B12", "B13", "B14", "B15", "B16", "B17", "B18"),
+  Plate     = factor(c("P1", "P1", "P2", "P2", "P3", "P3", "P4", "P4")),
+  Condition = factor(c("Cond3", "Cond4", "Cond3", "Cond4", "Cond3", "Cond4", "Cond3", "Cond4"))
+)
+
+# Align matrix columns with metadata sample order
+raw_counts <- raw_counts[, metadata$Sample]
+
+# ------------------------------------------------------------------------------
+# STEP 2: Construct DGEList & Design Matrix
+# ------------------------------------------------------------------------------
+# Model matrix accounting for paired plate design
+design <- model.matrix(~ Plate + Condition, data = metadata)
+
+# Create DGEList object and calculate TMM normalization factors
+dge_raw <- DGEList(counts = raw_counts, group = metadata$Condition)
+dge_raw <- calcNormFactors(dge_raw, method = "TMM")
+
+cat("Total initial features in raw matrix:", nrow(dge_raw), "\n\n")
+
+# ------------------------------------------------------------------------------
+# STEP 3: Iterate Over min.count Thresholds & Export Filtered TSV Files
+# ------------------------------------------------------------------------------
+thresholds <- c(20)
+
+for (mc in thresholds) {
+  
+  # Run filterByExpr with current min.count threshold
+  # Note: filterByExpr evaluates design leverage values to derive effective min
+  keep_genes <- filterByExpr(dge_raw, design = design, min.count = mc)
+  
+  # Subset DGEList and re-calculate library sizes
+  dge_filtered <- dge_raw[keep_genes, , keep.lib.sizes = FALSE]
+  
+  # Extract count matrix
+  filtered_matrix <- as.data.frame(dge_filtered$counts) %>%
+    rownames_to_column(var = "Gene")
+  
+  # Generate output filename
+  filename <- paste0("gene_count_matrix_filtered_exp2", mc, ".tsv")
+  
+  # Save to TSV
+  write_tsv(filtered_matrix, filename)
+  
+  # Output diagnostic summary
+  cat(sprintf("Threshold min.count = %2d  -->  Retained %5d genes (Removed %5d)  -->  Saved to: %s\n",
+              mc, sum(keep_genes), nrow(dge_raw) - sum(keep_genes), filename))
+}
+
+cat("\nFiltering complete! Cleaned count matrix saved successfully.\n")
+
+
+
+
+# ==============================================================================
+# PART 1: PAIRED RNA-SEQ ANALYSIS VIA LIMMA-VOOM (PROTEIN-CODING ONLY)
+# Pipeline: Primary Human Airway Epithelial Cell Transcriptomics
+# Software: R (v4.0+), limma, edgeR, biomaRt, tidyverse
+# Description: 
+#   1. Pre-filters raw counts for canonical protein-coding genes via BioMart
+#      (incorporating robust mirror & host failover loops).
+#   2. Recalculates TMM normalization over protein-coding features.
+#   3. Outputs paired plate log2FC matrix and 1-column DE
+#      results with FDR (adj.P.Val) calculations.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# STEP 1: Load Required Bioinformatics Libraries
+# ------------------------------------------------------------------------------
+library(edgeR)        # For DGEList container and TMM normalization
+library(limma)        # For voom transformation, lmFit, and eBayes modeling
+library(tidyverse)    # For data manipulation and piping
+library(biomaRt)      # For Ensembl annotation retrieval
+
+# ------------------------------------------------------------------------------
+# STEP 2: Import Filtered Count Matrix & Establish Metadata
+# ------------------------------------------------------------------------------
+# Read raw count matrix (Genes as rows, Samples B11-B18 as columns)
+counts <- read.table("gene_count_matrix_filtered_exp2.tsv", header = TRUE, row.names = 1, sep = "\t")
+
+# Establish experimental design and metadata
+metadata <- data.frame(
+  Sample    = c("B11", "B12", "B13", "B14", "B15", "B16", "B17", "B18"),
+  Plate     = factor(c("P1", "P1", "P2", "P2", "P3", "P3", "P4", "P4")),
+  Condition = factor(c("Cond3", "Cond4", "Cond3", "Cond4", "Cond3", "Cond4", "Cond3", "Cond4"))
+)
+rownames(metadata) <- metadata$Sample
+
+# Ensure count matrix columns match metadata rows
+counts <- counts[, metadata$Sample]
+
+# ------------------------------------------------------------------------------
+# STEP 3: BioMart Mirror & Host Failover Loop for Protein-Coding Pre-Filtering
+# ------------------------------------------------------------------------------
+# Extract clean Ensembl IDs (strip version decimal numbers)
+raw_ensembl_ids <- unique(gsub("\\..*", "", rownames(counts)))
+
+get_biomart_connection <- function() {
+  mirrors_to_try <- c("useast", "asia", "www")
+  
+  # 1. Try regional mirrors to bypass HTTP 404 / connection errors
+  for (m in mirrors_to_try) {
+    message(paste0("Attempting BioMart connection via mirror: '", m, "'..."))
+    mart <- tryCatch({
+      useEnsembl(
+        biomart = "genes", 
+        dataset = "hsapiens_gene_ensembl", 
+        mirror  = m
+      )
+    }, error = function(e) {
+      message(paste0("Mirror '", m, "' failed: ", e$message))
+      return(NULL)
+    })
+    
+    if (!is.null(mart)) {
+      message(paste0("Successfully connected to BioMart via '", m, "' mirror!"))
+      return(mart)
+    }
+  }
+  
+  # 2. Fallback to direct host URL if mirrors fail
+  message("Attempting direct host connection to 'https://www.ensembl.org'...")
+  mart <- tryCatch({
+    useMart(
+      biomart = "ENSEMBL_MART_ENSEMBL",
+      dataset = "hsapiens_gene_ensembl",
+      host    = "https://www.ensembl.org"
+    )
+  }, error = function(e) {
+    stop("CRITICAL: All BioMart mirrors and direct host connections failed.")
+  })
+  
+  return(mart)
+}
+
+# Establish mart connection
+mart <- get_biomart_connection()
+
+# Fetch gene biotypes with primary + fallback tryCatch
+message("Fetching gene biotypes from BioMart...")
+gene_annot_raw <- tryCatch({
+  getBM(
+    attributes = c("ensembl_gene_id", "gene_biotype"),
+    filters    = "ensembl_gene_id",
+    values     = raw_ensembl_ids,
+    mart       = mart
+  )
+}, error = function(e) {
+  message("getBM failed on primary connection. Retrying with direct host...")
+  fallback_mart <- useMart("ENSEMBL_MART_ENSEMBL", dataset = "hsapiens_gene_ensembl", host = "https://www.ensembl.org")
+  getBM(
+    attributes = c("ensembl_gene_id", "gene_biotype"),
+    filters    = "ensembl_gene_id",
+    values     = raw_ensembl_ids,
+    mart       = fallback_mart
+  )
+})
+
+# Filter for Ensembl IDs corresponding ONLY to protein_coding biotypes
+protein_coding_ids <- gene_annot_raw %>%
+  filter(gene_biotype == "protein_coding") %>%
+  pull(ensembl_gene_id) %>%
+  unique()
+
+# Subset row features of original count matrix to keep ONLY protein-coding genes
+clean_rownames <- gsub("\\..*", "", rownames(counts))
+counts_pc <- counts[clean_rownames %in% protein_coding_ids, ]
+
+cat(sprintf("\nPre-filtering complete:\n  Initial features: %d\n  Retained protein-coding genes: %d\n  Removed non-coding features: %d\n\n", 
+            nrow(counts), nrow(counts_pc), nrow(counts) - nrow(counts_pc)))
+
+# ------------------------------------------------------------------------------
+# STEP 4: Create DGEList Object & Calculate TMM Normalization Factors
+# ------------------------------------------------------------------------------
+# Store protein-coding counts and sample metadata in structured DGEList
+dge <- DGEList(counts = as.matrix(counts_pc), samples = metadata)
+
+# Calculate TMM normalization factors across protein-coding feature set
+dge <- calcNormFactors(dge, method = "TMM")
+
+# ------------------------------------------------------------------------------
+# STEP 5: Construct the Paired Experimental Design Matrix
+# ------------------------------------------------------------------------------
+# Define the paired fixed-effects blocking model formula: ~ Plate + Condition
+design <- model.matrix(~ Plate + Condition, data = dge$samples)
+
+# ------------------------------------------------------------------------------
+# STEP 6: Perform Voom Transformation (Log2CPM + Precision Weights)
+# ------------------------------------------------------------------------------
+# Convert counts to log2CPM using TMM factors and estimate observational weights
+v <- voom(dge, design, plot = TRUE)
+
+# ------------------------------------------------------------------------------
+# STEP 7: [REVIEWER OUTPUT] Extract 4-Column Plate-Level Paired Log2FC Matrix
+# ------------------------------------------------------------------------------
+# Extract normalized log2CPM expression matrix
+log2cpm <- v$E
+
+# Compute paired differences (Cond4 - Cond3) individually for each plate pair
+paired_log2fc_4col <- data.frame(
+  Plate1_log2FC = log2cpm[, "B12"] - log2cpm[, "B11"],  # P1: Cond4 (B12) - Cond3 (B11)
+  Plate2_log2FC = log2cpm[, "B14"] - log2cpm[, "B13"],  # P2: Cond4 (B14) - Cond3 (B13)
+  Plate3_log2FC = log2cpm[, "B16"] - log2cpm[, "B15"],  # P3: Cond4 (B16) - Cond3 (B15)
+  Plate4_log2FC = log2cpm[, "B18"] - log2cpm[, "B17"]   # P4: Cond4 (B18) - Cond3 (B17)
+)
+
+# Preserve gene Ensembl IDs as row names
+rownames(paired_log2fc_4col) <- rownames(log2cpm)
+
+# Export reviewer-requested 4-column response matrix
+write.csv(paired_log2fc_4col, "reviewer_plate_level_paired_log2FC_matrix_exp2.csv", quote = FALSE)
+
+# ------------------------------------------------------------------------------
+# STEP 8: [TRADITIONAL OUTPUT] Fit Linear Model & Extract Recalculated FDR
+# ------------------------------------------------------------------------------
+# Fit weighted linear regression for every gene incorporating plate baselines
+fit <- lmFit(v, design)
+
+# Apply Empirical Bayes moderation to shrink gene variances across the genome
+eb_fit <- eBayes(fit)
+
+# Extract full topTable containing average log2FC, t-statistic, p-value, and FDR
+# (FDR is now evaluated strictly over protein-coding genes)
+traditional_de_1col <- topTable(eb_fit, coef = "ConditionCond4", number = Inf)
+
+# Export traditional 1-column DE output
+write.csv(traditional_de_1col, "traditional_limma_voom_DE_results_exp2.csv", quote = FALSE)
+
+cat("PART 1 COMPLETE: Successfully filtered for protein-coding genes and exported both CSV datasets!\n")
+
+
+
+
+# ==============================================================================
+# PART 2: ANNOTATION & HIERARCHICAL DEDUPLICATION
+# Pipeline: Primary Human Airway Epithelial Cell Transcriptomics
+# Software: R (v4.0+), biomaRt, tidyverse
+# Description: Annotates 1-column limma-voom DE results and reviewer 4-column 
+#              plate log2FC matrices using BioMart with explicit namespace 
+#              prefixes for dplyr::select to protect against package masks.
+# ==============================================================================
+
+library(tidyverse)
+library(biomaRt)
+
+# ------------------------------------------------------------------------------
+# STEP 1: Load Datasets & Clean Ensembl IDs
+# ------------------------------------------------------------------------------
+de_results   <- read_csv("traditional_limma_voom_DE_results_exp2.csv")
+plate_log2fc <- read_csv("reviewer_plate_level_paired_log2FC_matrix_exp2.csv")
+
+# Ensure column 1 is named 'ensembl_gene_id' and strip version decimal numbers
+de_results <- de_results %>%
+  rename(ensembl_gene_id = 1) %>%
+  mutate(ensembl_clean = gsub("\\..*", "", ensembl_gene_id))
+
+plate_log2fc <- plate_log2fc %>%
+  rename(ensembl_gene_id = 1) %>%
+  mutate(ensembl_clean = gsub("\\..*", "", ensembl_gene_id))
+
+# Combine unique IDs for a single efficient BioMart call
+all_ensembl_ids <- unique(c(de_results$ensembl_clean, plate_log2fc$ensembl_clean))
+
+# ------------------------------------------------------------------------------
+# STEP 2: Connect to BioMart with Mirror & Host Failover Loop
+# ------------------------------------------------------------------------------
+get_biomart_connection <- function() {
+  mirrors_to_try <- c("useast", "asia", "www")
+  
+  # 1. Try regional mirrors to bypass HTTP 404 / req_perform errors
+  for (m in mirrors_to_try) {
+    message(paste0("Attempting BioMart connection via mirror: '", m, "'..."))
+    mart <- tryCatch({
+      useEnsembl(
+        biomart = "genes", 
+        dataset = "hsapiens_gene_ensembl", 
+        mirror  = m
+      )
+    }, error = function(e) {
+      message(paste0("Mirror '", m, "' failed: ", e$message))
+      return(NULL)
+    })
+    
+    if (!is.null(mart)) {
+      message(paste0("Successfully connected to BioMart via '", m, "' mirror!"))
+      return(mart)
+    }
+  }
+  
+  # 2. Fallback to direct host URL if mirrors fail
+  message("Attempting direct host connection to 'https://www.ensembl.org'...")
+  mart <- tryCatch({
+    useMart(
+      biomart = "ENSEMBL_MART_ENSEMBL",
+      dataset = "hsapiens_gene_ensembl",
+      host    = "https://www.ensembl.org"
+    )
+  }, error = function(e) {
+    stop("CRITICAL: All BioMart mirrors and direct host connections failed.")
+  })
+  
+  return(mart)
+}
+
+# Establish mart connection
+mart <- get_biomart_connection()
+
+# Fetch annotations with safety catch
+message("Fetching gene annotations from BioMart...")
+gene_annot_raw <- tryCatch({
+  getBM(
+    attributes = c("ensembl_gene_id", "hgnc_symbol", "gene_biotype"),
+    filters    = "ensembl_gene_id",
+    values     = all_ensembl_ids,
+    mart       = mart
+  )
+}, error = function(e) {
+  message("getBM failed on primary connection. Retrying with direct host...")
+  fallback_mart <- useMart("ENSEMBL_MART_ENSEMBL", dataset = "hsapiens_gene_ensembl", host = "https://www.ensembl.org")
+  getBM(
+    attributes = c("ensembl_gene_id", "hgnc_symbol", "gene_biotype"),
+    filters    = "ensembl_gene_id",
+    values     = all_ensembl_ids,
+    mart       = fallback_mart
+  )
+})
+
+# ------------------------------------------------------------------------------
+# STEP 3: Deduplication & Filtering (With Explicit dplyr::select)
+# ------------------------------------------------------------------------------
+id_map_clean <- gene_annot_raw %>%
+  mutate(
+    ensembl_gene_id_clean = as.character(ensembl_gene_id),
+    hgnc_symbol          = as.character(hgnc_symbol),
+    gene_biotype         = as.character(gene_biotype)
+  ) %>%
+  dplyr::select(-ensembl_gene_id) %>%  # Explicit namespace call
+  # 1. Strip empty or NA symbols so they don't corrupt downstream mapping
+  filter(hgnc_symbol != "" & !is.na(hgnc_symbol)) %>%
+  # 2. Prioritize "protein_coding" biotypes to the top per Ensembl ID
+  arrange(ensembl_gene_id_clean, desc(gene_biotype == "protein_coding")) %>%
+  # 3. Collapse duplicates by keeping only the top entry
+  distinct(ensembl_gene_id_clean, .keep_all = TRUE) %>%
+  rename(
+    ensembl_gene_id = ensembl_gene_id_clean,
+    gene_name       = hgnc_symbol
+  )
+
+# ------------------------------------------------------------------------------
+# STEP 4: Annotate & Export Datasets (With Explicit dplyr::select)
+# ------------------------------------------------------------------------------
+# 1. Traditional 1-column DE Results
+de_results_annotated <- de_results %>%
+  left_join(id_map_clean, by = c("ensembl_clean" = "ensembl_gene_id")) %>%
+  mutate(gene_name = ifelse(is.na(gene_name), ensembl_clean, gene_name)) %>%
+  mutate(gene_biotype = ifelse(is.na(gene_biotype), "unknown", gene_biotype)) %>%
+  dplyr::select(-ensembl_clean)  # Explicit namespace call
+
+write_csv(de_results_annotated, "traditional_limma_voom_DE_results_exp2_annotated.csv")
+
+# 2. Reviewer 4-column Plate Log2FC Matrix
+plate_log2fc_annotated <- plate_log2fc %>%
+  left_join(id_map_clean, by = c("ensembl_clean" = "ensembl_gene_id")) %>%
+  mutate(gene_name = ifelse(is.na(gene_name), ensembl_clean, gene_name)) %>%
+  mutate(gene_biotype = ifelse(is.na(gene_biotype), "unknown", gene_biotype)) %>%
+  dplyr::select(-ensembl_clean)  # Explicit namespace call
+
+write_csv(plate_log2fc_annotated, "reviewer_plate_level_paired_log2FC_matrix_exp2_annotated.csv")
+
+cat("PART 2 COMPLETE: Successfully annotated and saved both Experiment 2 datasets!\n")
+
+
+
+
+# ==============================================================================
+# PART 3: INTEGRATED PATHWAY EVALUATION OF TARGET GENE SET
+# Pipeline: Primary Human Airway Epithelial Cell Transcriptomics
+# Palette: Medium Lavender (#998CDC), Deep Purple (#5C439D), Forest Green (#084003)
+# Part A: Candidate GSEA & Visual Mountain Plot (fgsea + ggplot2)
+# Part B: 5-Panel Gene-Level Heatmap with Leading Edge Marking (ComplexHeatmap)
+# ==============================================================================
+
+library(tidyverse)
+library(fgsea)
+library(ComplexHeatmap)
+library(circlize)
+library(grid)
+library(cowplot)
+
+# ------------------------------------------------------------------------------
+# STEP 1: Define Target Gene Set & Load Input Data
+# ------------------------------------------------------------------------------
+targeted_set <- list(
+  "Type_I_III_IFN_Antiviral" = c(
+    "IFNB1", "IFNL1", "IFNL2", "IFNL3", "IFNAR1", "IFNAR2", "IFNLR1", "IL10RB", 
+    "JAK1", "TYK2", "STAT1", "STAT2", "IRF1", "IRF9", "MX1", "MX2", "IFITM1", 
+    "IFITM2", "IFITM3", "OAS1", "OAS2", "OAS3", "EIF2AK2", "RSAD2", "IFIT1", 
+    "IFIT2", "IFIT3", "ISG15", "ISG20", "IFI6"
+  )
+)
+
+de_results_full    <- read_csv("traditional_limma_voom_DE_results_exp2_annotated.csv")
+plate_log2fc_named <- read_csv("reviewer_plate_level_paired_log2FC_matrix_exp2_annotated.csv")
+
+# ------------------------------------------------------------------------------
+# STEP 2: Execute Targeted GSEA (fgsea) & Extract Leading Edge
+# ------------------------------------------------------------------------------
+if ("t" %in% colnames(de_results_full)) {
+  rank_col <- "t"
+} else if ("logFC" %in% colnames(de_results_full)) {
+  rank_col <- "logFC"
+} else if ("log2FC" %in% colnames(de_results_full)) {
+  rank_col <- "log2FC"
+} else {
+  stop("Error: Neither 't', 'logFC', nor 'log2FC' found in DE results CSV.")
+}
+
+message(paste0("Ranking full genome using column: '", rank_col, "'"))
+
+de_ranked <- de_results_full %>%
+  filter(!is.na(gene_name), !is.na(.data[[rank_col]])) %>%
+  distinct(gene_name, .keep_all = TRUE)
+
+stats_vector <- setNames(de_ranked[[rank_col]], de_ranked$gene_name)
+stats_vector <- sort(stats_vector, decreasing = TRUE)
+
+set.seed(42)
+gsea_results <- fgsea(
+  pathways = targeted_set,
+  stats   = stats_vector,
+  minSize = 5,
+  maxSize = 500
+)
+
+nes_val  <- sprintf("%.2f", gsea_results$NES[1])
+pval_val <- formatC(gsea_results$pval[1], format = "e", digits = 2)
+padj_val <- formatC(gsea_results$padj[1], format = "e", digits = 2)
+leading_edge_genes <- unlist(gsea_results$leadingEdge[1])
+
+cat(paste0("\n=== GSEA RESULTS SUMMARY ===\n",
+           "NES: ", nes_val, " | Nominal P: ", pval_val, " | FDR q: ", padj_val, "\n",
+           "Leading Edge Genes (", length(leading_edge_genes), "/", 
+           length(targeted_set[[1]]), "): ", paste(leading_edge_genes, collapse=", "), "\n\n"))
+
+# ------------------------------------------------------------------------------
+# STEP 3: Build Custom GSEA Mountain Plot (Manuscript Palette Theme)
+# ------------------------------------------------------------------------------
+gsea_curve <- plotEnrichmentData(
+  pathway = targeted_set[["Type_I_III_IFN_Antiviral"]],
+  stats  = stats_vector
+)
+
+p_mountain <- ggplot(gsea_curve$curve, aes(x = rank, y = ES)) +
+  geom_line(color = "#5C439D", linewidth = 1.2) +  # Primary curve: Deep Purple
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50", linewidth = 0.5) +
+  geom_segment(data = gsea_curve$ticks, 
+               aes(x = rank, xend = rank, y = -0.05, yend = -0.01), 
+               color = "#084003", alpha = 0.7, linewidth = 0.4) +  # Ticks: Forest Green
+  theme_classic(base_size = 11) +
+  labs(
+    title = "Gene Set Enrichment Analysis: Type I & III IFN Signaling",
+    x    = paste0("Rank in Ordered Dataset (Genome-Wide ", rank_col, ")"),
+    y    = "Running Enrichment Score (ES)"
+  ) +
+  annotate(
+    "label", 
+    x    = max(gsea_curve$curve$rank) * 0.75, 
+    y    = max(gsea_curve$curve$ES) * 0.85,
+    label = paste0("NES = ", nes_val, "\nNominal p = ", pval_val, "\nFDR q = ", padj_val, 
+                   "\nLeading Edge = ", length(leading_edge_genes), "/", length(targeted_set[[1]])),
+    fill = "#F2EFFB", color = "#5C439D", fontface = "bold", size = 3.5
+  ) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 12, hjust = 0.5),
+    axis.title       = element_text(face = "bold", size = 10),
+    panel.grid.major = element_line(color = "#F5F5F5")
+  )
+
+ggsave("Exp2_SingleSet_GSEA_MountainPlot.png", plot = p_mountain, width = 8, height = 4.5, dpi = 300)
+
+# ------------------------------------------------------------------------------
+# STEP 4: Filter & Prepare Gene-Level Data for Heatmap
+# ------------------------------------------------------------------------------
+ifn_df <- enframe(targeted_set, name = "Group", value = "gene_name") %>% unnest(cols = c(gene_name))
+
+ifn_matched       <- ifn_df %>% inner_join(de_results_full, by = "gene_name")
+ifn_matched_plate <- ifn_df %>% inner_join(plate_log2fc_named, by = "gene_name")
+
+common_genes      <- intersect(ifn_matched$gene_name, ifn_matched_plate$gene_name)
+ifn_matched       <- ifn_matched %>% filter(gene_name %in% common_genes)
+ifn_matched_plate <- ifn_matched_plate %>% filter(gene_name %in% common_genes)
+
+ifn_matched <- ifn_matched %>%
+  mutate(
+    is_leading_edge = ifelse(gene_name %in% leading_edge_genes, "Core Driver", "Other"),
+    adj.P.Val       = ifelse(is.na(adj.P.Val), 1, adj.P.Val),
+    P.Value         = ifelse(is.na(P.Value), 1, P.Value),
+    target_fdr      = p.adjust(P.Value, method = "BH"),
+    neg_log10_fdr   = -log10(adj.P.Val),
+    neg_log10_target_fdr = -log10(target_fdr),
+    neg_log10_rawp  = -log10(P.Value),
+    sig_symbol      = case_when(
+      adj.P.Val < 0.001 ~ "***",
+      adj.P.Val < 0.01  ~ "**",
+      adj.P.Val < 0.05  ~ "*",
+      TRUE              ~ ""
+    ),
+    fdr_text = case_when(
+      adj.P.Val < 0.001 ~ formatC(adj.P.Val, format = "e", digits = 1),
+      adj.P.Val < 0.99  ~ sprintf("%.3f", adj.P.Val),
+      TRUE              ~ "1.00"
+    ),
+    target_fdr_text = case_when(
+      target_fdr < 0.001 ~ formatC(target_fdr, format = "e", digits = 1),
+      target_fdr < 0.99  ~ sprintf("%.3f", target_fdr),
+      TRUE               ~ "1.00"
+    ),
+    rawp_text = case_when(
+      P.Value < 0.001 ~ formatC(P.Value, format = "e", digits = 1),
+      P.Value < 0.99  ~ sprintf("%.3f", P.Value),
+      TRUE            ~ "1.00"
+    )
+  )
+
+# ------------------------------------------------------------------------------
+# STEP 5: Construct Matrices & Annotations (Manuscript Palette Alignment)
+# ------------------------------------------------------------------------------
+mat_4col <- as.matrix(ifn_matched_plate[, c("Plate1_log2FC", "Plate2_log2FC", "Plate3_log2FC", "Plate4_log2FC")])
+colnames(mat_4col) <- c("P1", "P2", "P3", "P4")
+rownames(mat_4col) <- ifn_matched_plate$gene_name
+
+mat_1col <- as.matrix(ifn_matched[, "logFC", drop = FALSE])
+colnames(mat_1col) <- "Pop. log2FC"
+rownames(mat_1col) <- ifn_matched$gene_name
+
+mat_fdr <- as.matrix(ifn_matched[, "neg_log10_fdr", drop = FALSE])
+colnames(mat_fdr) <- "Genome FDR"
+rownames(mat_fdr) <- ifn_matched$gene_name
+
+mat_target_fdr <- as.matrix(ifn_matched[, "neg_log10_target_fdr", drop = FALSE])
+colnames(mat_target_fdr) <- "Target FDR"
+rownames(mat_target_fdr) <- ifn_matched$gene_name
+
+mat_rawp <- as.matrix(ifn_matched[, "neg_log10_rawp", drop = FALSE])
+colnames(mat_rawp) <- "Raw P-Val"
+rownames(mat_rawp) <- ifn_matched$gene_name
+
+# Diverging Log2FC Color Ramp: Forest Green (#084003) -> Off-White -> Medium Purple (#998CDC) -> Deep Purple (#5C439D)
+fc_limit <- quantile(abs(c(mat_4col, mat_1col)), 0.95, na.rm = TRUE)
+col_fc   <- colorRamp2(
+  c(-fc_limit, -fc_limit*0.25, 0, fc_limit*0.25, fc_limit), 
+  c("#084003", "#2E6928", "#FBFBF9", "#998CDC", "#5C439D") 
+)
+
+# Sequential Significance P-value Color Ramp: Lavender (#E8E3F5) -> Deep Purple (#5C439D)
+max_p_val <- max(c(mat_fdr, mat_target_fdr, mat_rawp), na.rm = TRUE)
+col_pval  <- colorRamp2(
+  c(0, 1.30, max(3, max_p_val * 0.5), max(4, max_p_val)), 
+  c("#E8E3F5", "#B8ACDC", "#7C63B8", "#3A2272") 
+)
+
+left_ann <- rowAnnotation(
+  `GSEA Core`          = ifn_matched$is_leading_edge,
+  col                  = list(`GSEA Core` = c("Core Driver" = "#5C439D", "Other" = "#E0E0E0")),
+  show_annotation_name = TRUE,
+  annotation_name_gp   = gpar(fontsize = 8, fontface = "bold"),
+  simple_anno_size     = unit(4, "mm")
+)
+
+# ------------------------------------------------------------------------------
+# STEP 6: Build 5 Heatmap Panels
+# ------------------------------------------------------------------------------
+ht1 <- Heatmap(
+  mat_4col, name = "log2FC", col = col_fc,
+  cluster_rows = TRUE, clustering_distance_rows = "euclidean", clustering_method_rows = "complete",
+  show_row_dend = TRUE, row_dend_width = unit(7, "mm"), cluster_columns = FALSE,
+  left_annotation = left_ann, column_title = "Plate Response",
+  column_title_gp = gpar(fontsize = 9.5, fontface = "bold"),
+  row_names_gp = gpar(fontsize = 7.5, fontface = "italic"),
+  border = TRUE, rect_gp = gpar(col = "white", lwd = 0.8)
+)
+
+ht2 <- Heatmap(
+  mat_1col, name = "Pop. log2FC", col = col_fc, cluster_rows = FALSE, cluster_columns = FALSE,
+  column_title = "Population", column_title_gp = gpar(fontsize = 9.5, fontface = "bold"),
+  show_row_names = FALSE, show_heatmap_legend = FALSE, border = TRUE, rect_gp = gpar(col = "white", lwd = 0.8),
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    grid.text(ifn_matched$sig_symbol[i], x, y, gp = gpar(fontsize = 9, fontface = "bold", col = "black"))
+  }
+)
+
+ht3 <- Heatmap(
+  mat_fdr, name = "-log10(Genome FDR)", col = col_pval, cluster_rows = FALSE, cluster_columns = FALSE,
+  column_title = "Genome FDR", column_title_gp = gpar(fontsize = 9.5, fontface = "bold"),
+  show_row_names = FALSE, border = TRUE, rect_gp = gpar(col = "white", lwd = 0.8),
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    raw_fdr <- ifn_matched$adj.P.Val[i]
+    grid.text(ifn_matched$fdr_text[i], x, y, gp = gpar(fontsize = 6.5, fontface = "bold", col = ifelse(raw_fdr <= 0.05, "white", "black")))
+  }
+)
+
+ht4 <- Heatmap(
+  mat_target_fdr, name = "-log10(Target FDR)", col = col_pval, cluster_rows = FALSE, cluster_columns = FALSE,
+  column_title = "Target FDR", column_title_gp = gpar(fontsize = 9.5, fontface = "bold"),
+  show_row_names = FALSE, border = TRUE, rect_gp = gpar(col = "white", lwd = 0.8),
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    t_fdr <- ifn_matched$target_fdr[i]
+    grid.text(ifn_matched$target_fdr_text[i], x, y, gp = gpar(fontsize = 6.5, fontface = "bold", col = ifelse(t_fdr <= 0.05, "white", "black")))
+  }
+)
+
+ht5 <- Heatmap(
+  mat_rawp, name = "Raw P-Val", col = col_pval, cluster_rows = FALSE, cluster_columns = FALSE,
+  column_title = "Raw P-Val", column_title_gp = gpar(fontsize = 9.5, fontface = "bold"),
+  show_row_names = TRUE, row_names_side = "right", row_names_gp = gpar(fontsize = 7.5, fontface = "italic"),
+  show_heatmap_legend = FALSE, border = TRUE, rect_gp = gpar(col = "white", lwd = 0.8),
+  cell_fun = function(j, i, x, y, width, height, fill) {
+    raw_pval <- ifn_matched$P.Value[i]
+    grid.text(ifn_matched$rawp_text[i], x, y, gp = gpar(fontsize = 6.5, fontface = "bold", col = ifelse(raw_pval <= 0.05, "white", "black")))
+  }
+)
+
+# ------------------------------------------------------------------------------
+# STEP 7: Export Combined Graphics
+# ------------------------------------------------------------------------------
+ht_list <- ht1 + ht2 + ht3 + ht4 + ht5
+
+png("Exp2_Targeted_GSEA_Annotated_Heatmap.png", width = 12, height = 9, units = "in", res = 300)
+draw(ht_list, ht_gap = unit(c(3, 3, 3, 3), "mm"), 
+     column_title = paste0("Type I & III IFN Pathway (GSEA NES = ", nes_val, ", FDR q = ", padj_val, ")"),
+     column_title_gp = gpar(fontsize = 12, fontface = "bold"),
+     heatmap_legend_side = "right", merge_legends = TRUE)
+dev.off()
+
+pdf("Exp2_Targeted_GSEA_Annotated_Heatmap.pdf", width = 12, height = 9)
+draw(ht_list, ht_gap = unit(c(3, 3, 3, 3), "mm"), 
+     column_title = paste0("Type I & III IFN Pathway (GSEA NES = ", nes_val, ", FDR q = ", padj_val, ")"),
+     column_title_gp = gpar(fontsize = 12, fontface = "bold"),
+     heatmap_legend_side = "right", merge_legends = TRUE)
+dev.off()
+
+message("PIPELINE COMPLETE: GSEA Mountain Plot & 5-Panel Heatmap Generated Successfully with Manuscript Palette.")
+
+
+
+
+# ==============================================================================
+# PART 4: UNBIASED GENOME-WIDE GSEA WITH KEYWORD FILTER (MSigDB Hallmark & GO:BP)
+# Pipeline: Primary Human Airway Epithelial Cell Transcriptomics
+# Palette: Medium Lavender (#998CDC), Deep Purple (#5C439D), Forest Green (#084003)
+# ==============================================================================
+
+library(tidyverse)
+library(fgsea)
+library(msigdbr)
+library(cowplot)
+library(ggridges)
+
+# ------------------------------------------------------------------------------
+# STEP 1: Load Full Genome DE Results & Prepare Rankings
+# ------------------------------------------------------------------------------
+de_results_full <- read_csv("traditional_limma_voom_DE_results_exp2_annotated.csv")
+
+# Determine available ranking metric (prefer 't', fall back to 'logFC' / 'log2FC')
+if ("t" %in% colnames(de_results_full)) {
+  rank_col <- "t"
+} else if ("logFC" %in% colnames(de_results_full)) {
+  rank_col <- "logFC"
+} else if ("log2FC" %in% colnames(de_results_full)) {
+  rank_col <- "log2FC"
+} else {
+  stop("Error: Neither 't', 'logFC', nor 'log2FC' found in DE results CSV.")
+}
+
+message(paste0("Ranking full genome using column: '", rank_col, "'"))
+
+# Clean and rank gene vector
+de_ranked <- de_results_full %>%
+  filter(!is.na(gene_name), !is.na(.data[[rank_col]])) %>%
+  distinct(gene_name, .keep_all = TRUE)
+
+stats_vector <- setNames(de_ranked[[rank_col]], de_ranked$gene_name)
+stats_vector <- sort(stats_vector, decreasing = TRUE)
+
+# ------------------------------------------------------------------------------
+# STEP 2: Fetch MSigDB Gene Sets (Human)
+# ------------------------------------------------------------------------------
+hs_hallmark <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+hs_gobp <- msigdbr(species = "Homo sapiens", category = "C5", subcategory = "BP") %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+# ------------------------------------------------------------------------------
+# STEP 3: Execute fgsea across Collections (Multi-level Sampling)
+# ------------------------------------------------------------------------------
+set.seed(42)
+
+# Run Hallmark GSEA
+gsea_hallmark <- fgsea(
+  pathways = hs_hallmark,
+  stats    = stats_vector,
+  minSize  = 15,
+  maxSize  = 500
+) %>%
+  as_tibble() %>%
+  arrange(padj)
+
+# Run GO:BP GSEA
+gsea_gobp <- fgsea(
+  pathways = hs_gobp,
+  stats    = stats_vector,
+  minSize  = 15,
+  maxSize  = 500
+) %>%
+  as_tibble() %>%
+  arrange(padj)
+
+# Format leadingEdge list column to character string for CSV export
+gsea_hallmark_export <- gsea_hallmark %>%
+  mutate(leadingEdge = sapply(leadingEdge, paste, collapse = "; "))
+
+gsea_gobp_export <- gsea_gobp %>%
+  mutate(leadingEdge = sapply(leadingEdge, paste, collapse = "; "))
+
+# Export Summary Tables
+write_csv(gsea_hallmark_export, "Exp2_Unbiased_GSEA_MSigDB_Hallmark_Results.csv")
+write_csv(gsea_gobp_export, "Exp2_Unbiased_GSEA_MSigDB_GOBP_Results.csv")
+
+# ------------------------------------------------------------------------------
+# STEP 4: Helper Functions for Custom Palette Visualization
+# ------------------------------------------------------------------------------
+
+# Function 1: Generate Dot Plot for Top Pathways
+plot_gsea_dotplot <- function(gsea_df, db_label, top_n = 10) {
+  top_up   <- gsea_df %>% filter(NES > 0) %>% slice_min(padj, n = top_n)
+  top_down <- gsea_df %>% filter(NES < 0) %>% slice_min(padj, n = top_n)
+  
+  plot_df  <- bind_rows(top_up, top_down) %>%
+    mutate(
+      pathway_clean  = gsub("^HALLMARK_|^GOBP_", "", pathway),
+      pathway_clean  = gsub("_", " ", pathway_clean),
+      pathway_clean  = str_wrap(pathway_clean, width = 45),
+      pathway_clean  = fct_reorder(pathway_clean, NES),
+      neg_log10_padj = -log10(padj)
+    )
+  
+  ggplot(plot_df, aes(x = NES, y = pathway_clean)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray60") +
+    geom_point(aes(size = size, color = NES), alpha = 0.9) +
+    scale_color_gradient2(
+      low = "#084003", mid = "#FBFBF9", high = "#5C439D", midpoint = 0,
+      name = "NES"
+    ) +
+    scale_size_continuous(name = "Gene Set Size", range = c(3, 8)) +
+    theme_classic(base_size = 11) +
+    labs(
+      title = paste0("Top Enriched Pathways: ", db_label),
+      x     = "Normalized Enrichment Score (NES)",
+      y     = NULL
+    ) +
+    theme(
+      plot.title         = element_text(face = "bold", size = 12, hjust = 0.5),
+      axis.text.y        = element_text(size = 8.5, face = "bold"),
+      axis.title.x       = element_text(face = "bold", size = 10),
+      panel.grid.major.y = element_line(color = "#F0F0F0")
+    )
+}
+
+# Function 2: Single Mountain Plot with Palette Context
+plot_single_mountain <- function(pathway_name, pathways_list, stats, nes, padj, pval) {
+  gsea_curve <- plotEnrichmentData(pathway = pathways_list[[pathway_name]], stats = stats)
+  
+  # Pick curve color based on NES direction (Deep Purple = Pos/Up, Forest Green = Neg/Down)
+  line_col <- if (nes >= 0) "#5C439D" else "#084003"
+  bg_col   <- if (nes >= 0) "#F2EFFB" else "#E8F0E6"
+  txt_col  <- if (nes >= 0) "#3A2272" else "#042001"
+  
+  pathway_clean <- gsub("^HALLMARK_|^GOBP_", "", pathway_name)
+  pathway_clean <- gsub("_", " ", pathway_clean)
+  
+  ggplot(gsea_curve$curve, aes(x = rank, y = ES)) +
+    geom_line(color = line_col, linewidth = 1.2) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray50", linewidth = 0.5) +
+    geom_segment(data = gsea_curve$ticks, 
+                 aes(x = rank, xend = rank, y = -0.05, yend = -0.01), 
+                 color = "#084003", alpha = 0.7, linewidth = 0.4) +
+    theme_classic(base_size = 11) +
+    labs(
+      title = paste0("GSEA: ", pathway_clean),
+      x     = paste0("Rank in Ordered Dataset (Genome-Wide ", rank_col, ")"),
+      y     = "Running Enrichment Score (ES)"
+    ) +
+    annotate(
+      "label", 
+      x     = max(gsea_curve$curve$rank) * 0.75, 
+      y     = ifelse(nes >= 0, max(gsea_curve$curve$ES) * 0.85, min(gsea_curve$curve$ES) * 0.85),
+      label = paste0("NES = ", sprintf("%.2f", nes), 
+                     "\nNominal p = ", formatC(pval, format = "e", digits = 2), 
+                     "\nFDR q = ", formatC(padj, format = "e", digits = 2)),
+      fill  = bg_col, color = txt_col, fontface = "bold", size = 3.5
+    ) +
+    theme(
+      plot.title       = element_text(face = "bold", size = 11, hjust = 0.5),
+      axis.title       = element_text(face = "bold", size = 10),
+      panel.grid.major = element_line(color = "#F5F5F5")
+    )
+}
+
+# ------------------------------------------------------------------------------
+# STEP 5: Keyword Search & Rank Logic (padj < 0.05 -> Rank by NES -> Top 5)
+# ------------------------------------------------------------------------------
+filter_keywords_by_db <- function(gsea_df, db_name) {
+  kw_immune <- gsea_df %>%
+    filter(padj < 0.05) %>%
+    filter(grepl("IMMUNE", pathway, ignore.case = TRUE)) %>%
+    arrange(desc(abs(NES))) %>%
+    slice_head(n = 5) %>%
+    mutate(group = "Immune")
+
+  kw_interferon <- gsea_df %>%
+    filter(padj < 0.05) %>%
+    filter(grepl("INTERFERON", pathway, ignore.case = TRUE)) %>%
+    arrange(desc(abs(NES))) %>%
+    slice_head(n = 5) %>%
+    mutate(group = "Interferon")
+
+  kw_viral <- gsea_df %>%
+    filter(padj < 0.05) %>%
+    filter(grepl("VIRUS|VIRAL", pathway, ignore.case = TRUE)) %>%
+    arrange(desc(abs(NES))) %>%
+    slice_head(n = 5) %>%
+    mutate(group = "Virus_Viral")
+
+  bind_rows(kw_immune, kw_interferon, kw_viral) %>%
+    distinct(pathway, .keep_all = TRUE) %>%
+    mutate(db = db_name)
+}
+
+target_hallmark_df <- filter_keywords_by_db(gsea_hallmark, "MSigDB Hallmark")
+target_gobp_df     <- filter_keywords_by_db(gsea_gobp, "MSigDB GO:BP")
+
+# ------------------------------------------------------------------------------
+# STEP 6: Visualization Functions (Dot Plot, Ridge Plot & Combined Plot)
+# ------------------------------------------------------------------------------
+plot_target_dotplot <- function(target_df, db_label) {
+  plot_df <- target_df %>%
+    mutate(
+      pathway_clean = gsub("^HALLMARK_|^GOBP_", "", pathway),
+      pathway_clean = gsub("_", " ", pathway_clean),
+      pathway_clean = str_wrap(pathway_clean, width = 40),
+      pathway_clean = fct_reorder(pathway_clean, NES)
+    )
+  
+  ggplot(plot_df, aes(x = NES, y = pathway_clean)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray60") +
+    geom_point(aes(size = size, color = NES), alpha = 0.9) +
+    scale_color_gradient2(
+      low = "#084003", mid = "#FBFBF9", high = "#5C439D", midpoint = 0,
+      name = "NES"
+    ) +
+    scale_size_continuous(name = "Gene Set Size", range = c(3, 8)) +
+    facet_grid(group ~ ., scales = "free_y", space = "free_y") +
+    theme_classic(base_size = 11) +
+    labs(
+      title = paste0("Targeted Pathways (padj < 0.05, Top NES): ", db_label),
+      x     = "Normalized Enrichment Score (NES)",
+      y     = NULL
+    ) +
+    theme(
+      plot.title         = element_text(face = "bold", size = 11, hjust = 0.5),
+      axis.text.y        = element_text(size = 8.5, face = "bold"),
+      axis.title.x       = element_text(face = "bold", size = 10),
+      strip.background   = element_rect(fill = "#F2EFFB", color = "#5C439D"),
+      strip.text         = element_text(face = "bold", color = "#3A2272", size = 9.5),
+      panel.grid.major.y = element_line(color = "#F0F0F0")
+    )
+}
+
+plot_target_ridge <- function(target_df, pathways_list, stats, db_label) {
+  ridge_data_list <- list()
+  
+  for (i in seq_len(nrow(target_df))) {
+    pw_name  <- target_df$pathway[i]
+    pw_group <- target_df$group[i]
+    pw_genes <- intersect(pathways_list[[pw_name]], names(stats))
+    
+    if (length(pw_genes) > 0) {
+      clean_name <- gsub("^HALLMARK_|^GOBP_", "", pw_name)
+      clean_name <- gsub("_", " ", clean_name)
+      
+      ridge_data_list[[i]] <- tibble(
+        pathway = clean_name,
+        group   = pw_group,
+        stat    = stats[pw_genes]
+      )
+    }
+  }
+  
+  ridge_df <- bind_rows(ridge_data_list) %>%
+    mutate(pathway = str_wrap(pathway, width = 40))
+  
+  pathway_order <- ridge_df %>%
+    group_by(pathway) %>%
+    summarise(mean_stat = mean(stat)) %>%
+    arrange(mean_stat) %>%
+    pull(pathway)
+  
+  ridge_df <- ridge_df %>% mutate(pathway = factor(pathway, levels = pathway_order))
+  
+  ggplot(ridge_df, aes(x = stat, y = pathway, fill = ..x..)) +
+    geom_density_ridges_gradient(scale = 1.3, rel_min_height = 0.01, color = "white", linewidth = 0.3) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+    scale_fill_gradient2(
+      low = "#084003", mid = "#FBFBF9", high = "#5C439D", midpoint = 0,
+      name = paste0("Rank Metric (", rank_col, ")")
+    ) +
+    facet_grid(group ~ ., scales = "free_y", space = "free_y") +
+    theme_classic(base_size = 11) +
+    labs(
+      title = paste0("Ranked Expression Distribution (padj < 0.05, Top NES): ", db_label),
+      x     = paste0("Gene-Level Ranking Statistic (", rank_col, ")"),
+      y     = NULL
+    ) +
+    theme(
+      plot.title         = element_text(face = "bold", size = 11, hjust = 0.5),
+      axis.text.y        = element_text(size = 8.5, face = "bold"),
+      axis.title.x       = element_text(face = "bold", size = 10),
+      strip.background   = element_rect(fill = "#F2EFFB", color = "#5C439D"),
+      strip.text         = element_text(face = "bold", color = "#3A2272", size = 9.5),
+      panel.grid.major.y = element_line(color = "#F0F0F0")
+    )
+}
+
+save_targeted_mountain_plots <- function(target_df, pathways_list, stats, db_prefix) {
+  if (nrow(target_df) == 0) return(NULL)
+  
+  for (i in seq_len(nrow(target_df))) {
+    row <- target_df[i, ]
+    p_m <- plot_single_mountain(
+      pathway_name  = row$pathway,
+      pathways_list = pathways_list,
+      stats         = stats,
+      nes           = row$NES,
+      padj          = row$padj,
+      pval          = row$pval
+    )
+    clean_fname <- gsub("[^A-Za-z0-9]", "_", row$pathway)
+    file_name   <- paste0("Exp2_Targeted_MountainPlot_", db_prefix, "_", row$group, "_", clean_fname, ".png")
+    ggsave(file_name, plot = p_m, width = 7.5, height = 4.2, dpi = 300)
+  }
+}
+
+plot_combined_dot_ridge <- function(target_df, pathways_list, stats, db_label) {
+  target_df <- target_df %>%
+    mutate(
+      pathway_clean = gsub("^HALLMARK_|^GOBP_", "", pathway),
+      pathway_clean = gsub("_", " ", pathway_clean),
+      pathway_clean = str_wrap(pathway_clean, width = 25),
+      pathway_clean = fct_reorder(pathway_clean, NES)
+    )
+  
+  pathway_levels <- levels(target_df$pathway_clean)
+  
+  p_dot <- ggplot(target_df, aes(x = NES, y = pathway_clean)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray60") +
+    geom_point(aes(size = size, color = NES), alpha = 0.9) +
+    scale_color_gradient2(
+      low = "#084003", mid = "#FBFBF9", high = "#5C439D", midpoint = 0,
+      name = "NES"
+    ) +
+    scale_size_continuous(name = "Gene Set Size", range = c(3, 7)) +
+    facet_grid(group ~ ., scales = "free_y", space = "free_y") +
+    theme_classic(base_size = 11) +
+    labs(
+      title = "GSEA Enrichment (NES & Size)",
+      x     = "Normalized Enrichment Score (NES)",
+      y     = NULL
+    ) +
+    theme(
+      plot.title         = element_text(face = "bold", size = 11, hjust = 0),
+      axis.text.y        = element_text(size = 8.5, face = "bold"),
+      axis.title.x       = element_text(face = "bold", size = 9.5),
+      strip.background   = element_rect(fill = "#F2EFFB", color = "#5C439D"),
+      strip.text         = element_text(face = "bold", color = "#3A2272", size = 9),
+      panel.grid.major.y = element_line(color = "#F0F0F0")
+    )
+
+  ridge_data_list <- list()
+  for (i in seq_len(nrow(target_df))) {
+    pw_name  <- target_df$pathway[i]
+    pw_group <- target_df$group[i]
+    pw_genes <- intersect(pathways_list[[pw_name]], names(stats))
+    
+    if (length(pw_genes) > 0) {
+      clean_name <- gsub("^HALLMARK_|^GOBP_", "", pw_name)
+      clean_name <- gsub("_", " ", clean_name)
+      clean_name <- str_wrap(clean_name, width = 25)
+      
+      ridge_data_list[[i]] <- tibble(
+        pathway_clean = clean_name,
+        group         = pw_group,
+        stat          = stats[pw_genes]
+      )
+    }
+  }
+  
+  ridge_df <- bind_rows(ridge_data_list) %>%
+    mutate(pathway_clean = factor(pathway_clean, levels = pathway_levels))
+  
+  p_ridge <- ggplot(ridge_df, aes(x = stat, y = pathway_clean, fill = ..x..)) +
+    geom_density_ridges_gradient(scale = 1.2, rel_min_height = 0.01, color = "white", linewidth = 0.3) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+    scale_fill_gradient2(
+      low = "#084003", mid = "#FBFBF9", high = "#5C439D", midpoint = 0,
+      name = paste0("Rank Metric (", rank_col, ")")
+    ) +
+    facet_grid(group ~ ., scales = "free_y", space = "free_y") +
+    theme_classic(base_size = 11) +
+    labs(
+      title = "Gene Metric Distribution",
+      x     = paste0("Ranking Statistic (", rank_col, ")"),
+      y     = NULL
+    ) +
+    theme(
+      plot.title         = element_text(face = "bold", size = 11, hjust = 0),
+      axis.text.y        = element_blank(),
+      axis.ticks.y       = element_blank(),
+      axis.title.x       = element_text(face = "bold", size = 9.5),
+      strip.background   = element_blank(),
+      strip.text         = element_blank(),
+      panel.grid.major.y = element_line(color = "#F0F0F0")
+    )
+
+  cowplot::plot_grid(
+    p_dot, p_ridge,
+    ncol       = 2,
+    rel_widths = c(1.4, 1.0),
+    align      = "h",
+    axis       = "tb"
+  )
+}
+
+# ------------------------------------------------------------------------------
+# STEP 7: Generate & Save All Plots
+# ------------------------------------------------------------------------------
+p_dot_hallmark <- plot_gsea_dotplot(gsea_hallmark, "MSigDB Hallmark")
+ggsave("Exp2_Unbiased_GSEA_Hallmark_DotPlot.png", plot = p_dot_hallmark, width = 8, height = 6.5, dpi = 300)
+
+p_dot_gobp <- plot_gsea_dotplot(gsea_gobp, "MSigDB GO:BP")
+ggsave("Exp2_Unbiased_GSEA_GOBP_DotPlot.png", plot = p_dot_gobp, width = 9, height = 7.5, dpi = 300)
+
+if (nrow(target_hallmark_df) > 0) {
+  p_hallmark_target_dot <- plot_target_dotplot(target_hallmark_df, "MSigDB Hallmark")
+  ggsave("Exp2_Targeted_Keywords_Hallmark_DotPlot.png", plot = p_hallmark_target_dot, width = 9, height = 7.5, dpi = 300)
+
+  p_hallmark_target_ridge <- plot_target_ridge(target_hallmark_df, hs_hallmark, stats_vector, "MSigDB Hallmark")
+  ggsave("Exp2_Targeted_Keywords_Hallmark_RidgePlot.png", plot = p_hallmark_target_ridge, width = 9, height = 7.5, dpi = 300)
+
+  p_hallmark_comb <- plot_combined_dot_ridge(target_hallmark_df, hs_hallmark, stats_vector, "MSigDB Hallmark")
+  ggsave("Exp2_Targeted_Keywords_Hallmark_Combined_Dot_Ridge.png", plot = p_hallmark_comb, width = 12, height = 7.5, dpi = 300)
+
+  save_targeted_mountain_plots(target_hallmark_df, hs_hallmark, stats_vector, "Hallmark")
+} else {
+  message("No Hallmark pathways matched the keyword criteria with padj < 0.05.")
+}
+
+if (nrow(target_gobp_df) > 0) {
+  p_gobp_target_dot <- plot_target_dotplot(target_gobp_df, "MSigDB GO:BP")
+  ggsave("Exp2_Targeted_Keywords_GOBP_DotPlot.png", plot = p_gobp_target_dot, width = 9, height = 8.5, dpi = 300)
+
+  p_gobp_target_ridge <- plot_target_ridge(target_gobp_df, hs_gobp, stats_vector, "MSigDB GO:BP")
+  ggsave("Exp2_Targeted_Keywords_GOBP_RidgePlot.png", plot = p_gobp_target_ridge, width = 9, height = 8.5, dpi = 300)
+
+  p_gobp_comb <- plot_combined_dot_ridge(target_gobp_df, hs_gobp, stats_vector, "MSigDB GO:BP")
+  ggsave("Exp2_Targeted_Keywords_GOBP_Combined_Dot_Ridge.png", plot = p_gobp_comb, width = 12, height = 8.5, dpi = 300)
+
+  save_targeted_mountain_plots(target_gobp_df, hs_gobp, stats_vector, "GOBP")
+} else {
+  message("No GO:BP pathways matched the keyword criteria with padj < 0.05.")
+}
+
+message("TARGETED GSEA COMPLETE: All plots saved successfully using manuscript palette.")
+
+
+
+
+# ==============================================================================
+# PART 5: UNBIASED TOP 15 GENOME-WIDE GSEA & VOLCANO PLOT
+# Pipeline: Primary Human Airway Epithelial Cell Transcriptomics
+# Palette: Medium Lavender (#998CDC), Deep Purple (#5C439D), Forest Green (#084003)
+# Cutoffs: 2-Fold Change (|log2FC| >= 1.0), Raw P < 0.01, Top 5 Labeled per side
+# ==============================================================================
+
+library(tidyverse)
+library(fgsea)
+library(msigdbr)
+library(cowplot)
+library(ggridges)
+library(ggrepel)
+
+# ------------------------------------------------------------------------------
+# STEP 1: Load Full Genome DE Results & Prepare Rankings
+# ------------------------------------------------------------------------------
+de_results_full <- read_csv("traditional_limma_voom_DE_results_exp2_annotated.csv")
+
+# Determine available ranking metric (prefer 't', fall back to 'logFC' / 'log2FC')
+if ("t" %in% colnames(de_results_full)) {
+  rank_col <- "t"
+} else if ("logFC" %in% colnames(de_results_full)) {
+  rank_col <- "logFC"
+} else if ("log2FC" %in% colnames(de_results_full)) {
+  rank_col <- "log2FC"
+} else {
+  stop("Error: Neither 't', 'logFC', nor 'log2FC' found in DE results CSV.")
+}
+
+message(paste0("Ranking full genome using column: '", rank_col, "'"))
+
+# Clean and rank gene vector
+de_ranked <- de_results_full %>%
+  filter(!is.na(gene_name), !is.na(.data[[rank_col]])) %>%
+  distinct(gene_name, .keep_all = TRUE)
+
+stats_vector <- setNames(de_ranked[[rank_col]], de_ranked$gene_name)
+stats_vector <- sort(stats_vector, decreasing = TRUE)
+
+# ------------------------------------------------------------------------------
+# STEP 2: Fetch MSigDB Gene Sets (Human)
+# ------------------------------------------------------------------------------
+hs_hallmark <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+hs_gobp <- msigdbr(species = "Homo sapiens", category = "C5", subcategory = "BP") %>%
+  split(x = .$gene_symbol, f = .$gs_name)
+
+# ------------------------------------------------------------------------------
+# STEP 3: Execute fgsea across Collections (Multi-level Sampling)
+# ------------------------------------------------------------------------------
+set.seed(42)
+
+# Run Hallmark GSEA
+gsea_hallmark <- fgsea(
+  pathways = hs_hallmark,
+  stats    = stats_vector,
+  minSize  = 15,
+  maxSize  = 500
+) %>%
+  as_tibble() %>%
+  arrange(padj)
+
+# Run GO:BP GSEA
+gsea_gobp <- fgsea(
+  pathways = hs_gobp,
+  stats    = stats_vector,
+  minSize  = 15,
+  maxSize  = 500
+) %>%
+  as_tibble() %>%
+  arrange(padj)
+
+# Format leadingEdge list column to character string for CSV export
+gsea_hallmark_export <- gsea_hallmark %>%
+  mutate(leadingEdge = sapply(leadingEdge, paste, collapse = "; "))
+
+gsea_gobp_export <- gsea_gobp %>%
+  mutate(leadingEdge = sapply(leadingEdge, paste, collapse = "; "))
+
+# Export Summary Tables
+write_csv(gsea_hallmark_export, "Exp2_Unbiased_GSEA_MSigDB_Hallmark_Results.csv")
+write_csv(gsea_gobp_export, "Exp2_Unbiased_GSEA_MSigDB_GOBP_Results.csv")
+
+# ------------------------------------------------------------------------------
+# STEP 4: Helper Functions for Custom Palette Visualization
+# ------------------------------------------------------------------------------
+
+# Function 1: Generate Dot Plot for Top Pathways
+plot_gsea_dotplot <- function(gsea_df, db_label, top_n = 10) {
+  top_up   <- gsea_df %>% filter(NES > 0) %>% slice_min(padj, n = top_n)
+  top_down <- gsea_df %>% filter(NES < 0) %>% slice_min(padj, n = top_n)
+  
+  plot_df  <- bind_rows(top_up, top_down) %>%
+    mutate(
+      pathway_clean  = gsub("^HALLMARK_|^GOBP_", "", pathway),
+      pathway_clean  = gsub("_", " ", pathway_clean),
+      pathway_clean  = str_wrap(pathway_clean, width = 45),
+      pathway_clean  = fct_reorder(pathway_clean, NES),
+      neg_log10_padj = -log10(padj)
+    )
+  
+  ggplot(plot_df, aes(x = NES, y = pathway_clean)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray60") +
+    geom_point(aes(size = size, color = NES), alpha = 0.9) +
+    scale_color_gradient2(
+      low = "#084003", mid = "#FBFBF9", high = "#5C439D", midpoint = 0,
+      name = "NES"
+    ) +
+    scale_size_continuous(name = "Gene Set Size", range = c(3, 8)) +
+    theme_classic(base_size = 11) +
+    labs(
+      title = paste0("Top Enriched Pathways: ", db_label),
+      x     = "Normalized Enrichment Score (NES)",
+      y     = NULL
+    ) +
+    theme(
+      plot.title         = element_text(face = "bold", size = 12, hjust = 0.5),
+      axis.text.y        = element_text(size = 8.5, face = "bold"),
+      axis.title.x       = element_text(face = "bold", size = 10),
+      panel.grid.major.y = element_line(color = "#F0F0F0")
+    )
+}
+
+# Function 2: Single Mountain Plot with Palette Context
+plot_single_mountain <- function(pathway_name, pathways_list, stats, nes, padj, pval) {
+  gsea_curve <- plotEnrichmentData(pathway = pathways_list[[pathway_name]], stats = stats)
+  
+  line_col <- if (nes >= 0) "#5C439D" else "#084003"
+  bg_col   <- if (nes >= 0) "#F2EFFB" else "#E8F0E6"
+  txt_col  <- if (nes >= 0) "#3A2272" else "#042001"
+  
+  pathway_clean <- gsub("^HALLMARK_|^GOBP_", "", pathway_name)
+  pathway_clean <- gsub("_", " ", pathway_clean)
+  
+  ggplot(gsea_curve$curve, aes(x = rank, y = ES)) +
+    geom_line(color = line_col, linewidth = 1.2) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray50", linewidth = 0.5) +
+    geom_segment(data = gsea_curve$ticks, 
+                 aes(x = rank, xend = rank, y = -0.05, yend = -0.01), 
+                 color = "#084003", alpha = 0.7, linewidth = 0.4) +
+    theme_classic(base_size = 11) +
+    labs(
+      title = paste0("GSEA: ", pathway_clean),
+      x     = paste0("Rank in Ordered Dataset (Genome-Wide ", rank_col, ")"),
+      y     = "Running Enrichment Score (ES)"
+    ) +
+    annotate(
+      "label", 
+      x     = max(gsea_curve$curve$rank) * 0.75, 
+      y     = ifelse(nes >= 0, max(gsea_curve$curve$ES) * 0.85, min(gsea_curve$curve$ES) * 0.85),
+      label = paste0("NES = ", sprintf("%.2f", nes), 
+                     "\nNominal p = ", formatC(pval, format = "e", digits = 2), 
+                     "\nFDR q = ", formatC(padj, format = "e", digits = 2)),
+      fill  = bg_col, color = txt_col, fontface = "bold", size = 3.5
+    ) +
+    theme(
+      plot.title       = element_text(face = "bold", size = 11, hjust = 0.5),
+      axis.title       = element_text(face = "bold", size = 10),
+      panel.grid.major = element_line(color = "#F5F5F5")
+    )
+}
+
+# ------------------------------------------------------------------------------
+# STEP 5: Select Top 15 Pathways Overall (padj < 0.05 -> Rank by NES)
+# ------------------------------------------------------------------------------
+select_top15_pathways <- function(gsea_df, db_name) {
+  gsea_df %>%
+    filter(padj < 0.05) %>%
+    arrange(desc(abs(NES))) %>%
+    slice_head(n = 15) %>%
+    mutate(
+      group = ifelse(NES > 0, "Upregulated", "Downregulated"),
+      db    = db_name
+    )
+}
+
+target_hallmark_df <- select_top15_pathways(gsea_hallmark, "MSigDB Hallmark")
+target_gobp_df     <- select_top15_pathways(gsea_gobp, "MSigDB GO:BP")
+
+# ------------------------------------------------------------------------------
+# STEP 6: Visualization Functions (Dot, Ridge, Combined & Volcano Plots)
+# ------------------------------------------------------------------------------
+plot_target_dotplot <- function(target_df, db_label) {
+  plot_df <- target_df %>%
+    mutate(
+      pathway_clean = gsub("^HALLMARK_|^GOBP_", "", pathway),
+      pathway_clean = gsub("_", " ", pathway_clean),
+      pathway_clean = str_wrap(pathway_clean, width = 40),
+      pathway_clean = fct_reorder(pathway_clean, NES)
+    )
+  
+  ggplot(plot_df, aes(x = NES, y = pathway_clean)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray60") +
+    geom_point(aes(size = size, color = NES), alpha = 0.9) +
+    scale_color_gradient2(
+      low = "#084003", mid = "#FBFBF9", high = "#5C439D", midpoint = 0,
+      name = "NES"
+    ) +
+    scale_size_continuous(name = "Gene Set Size", range = c(3, 8)) +
+    facet_grid(group ~ ., scales = "free_y", space = "free_y") +
+    theme_classic(base_size = 11) +
+    labs(
+      title = paste0("Top 15 Enriched Pathways (padj < 0.05): ", db_label),
+      x     = "Normalized Enrichment Score (NES)",
+      y     = NULL
+    ) +
+    theme(
+      plot.title         = element_text(face = "bold", size = 11, hjust = 0.5),
+      axis.text.y        = element_text(size = 8.5, face = "bold"),
+      axis.title.x       = element_text(face = "bold", size = 10),
+      strip.background   = element_rect(fill = "#F2EFFB", color = "#5C439D"),
+      strip.text         = element_text(face = "bold", color = "#3A2272", size = 9.5),
+      panel.grid.major.y = element_line(color = "#F0F0F0")
+    )
+}
+
+plot_target_ridge <- function(target_df, pathways_list, stats, db_label) {
+  ridge_data_list <- list()
+  
+  for (i in seq_len(nrow(target_df))) {
+    pw_name  <- target_df$pathway[i]
+    pw_group <- target_df$group[i]
+    pw_genes <- intersect(pathways_list[[pw_name]], names(stats))
+    
+    if (length(pw_genes) > 0) {
+      clean_name <- gsub("^HALLMARK_|^GOBP_", "", pw_name)
+      clean_name <- gsub("_", " ", clean_name)
+      
+      ridge_data_list[[i]] <- tibble(
+        pathway = clean_name,
+        group   = pw_group,
+        stat    = stats[pw_genes]
+      )
+    }
+  }
+  
+  ridge_df <- bind_rows(ridge_data_list) %>%
+    mutate(pathway = str_wrap(pathway, width = 40))
+  
+  pathway_order <- ridge_df %>%
+    group_by(pathway) %>%
+    summarise(mean_stat = mean(stat)) %>%
+    arrange(mean_stat) %>%
+    pull(pathway)
+  
+  ridge_df <- ridge_df %>% mutate(pathway = factor(pathway, levels = pathway_order))
+  
+  ggplot(ridge_df, aes(x = stat, y = pathway, fill = ..x..)) +
+    geom_density_ridges_gradient(scale = 1.3, rel_min_height = 0.01, color = "white", linewidth = 0.3) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+    scale_fill_gradient2(
+      low = "#084003", mid = "#FBFBF9", high = "#5C439D", midpoint = 0,
+      name = paste0("Rank Metric (", rank_col, ")")
+    ) +
+    facet_grid(group ~ ., scales = "free_y", space = "free_y") +
+    theme_classic(base_size = 11) +
+    labs(
+      title = paste0("Ranked Expression Distribution (Top 15 Pathways): ", db_label),
+      x     = paste0("Gene-Level Ranking Statistic (", rank_col, ")"),
+      y     = NULL
+    ) +
+    theme(
+      plot.title         = element_text(face = "bold", size = 11, hjust = 0.5),
+      axis.text.y        = element_text(size = 8.5, face = "bold"),
+      axis.title.x       = element_text(face = "bold", size = 10),
+      strip.background   = element_rect(fill = "#F2EFFB", color = "#5C439D"),
+      strip.text         = element_text(face = "bold", color = "#3A2272", size = 9.5),
+      panel.grid.major.y = element_line(color = "#F0F0F0")
+    )
+}
+
+save_targeted_mountain_plots <- function(target_df, pathways_list, stats, db_prefix) {
+  if (nrow(target_df) == 0) return(NULL)
+  
+  for (i in seq_len(nrow(target_df))) {
+    row <- target_df[i, ]
+    p_m <- plot_single_mountain(
+      pathway_name  = row$pathway,
+      pathways_list = pathways_list,
+      stats         = stats,
+      nes           = row$NES,
+      padj          = row$padj,
+      pval          = row$pval
+    )
+    clean_fname <- gsub("[^A-Za-z0-9]", "_", row$pathway)
+    file_name   <- paste0("Exp2_Top15_MountainPlot_", db_prefix, "_", row$group, "_", clean_fname, ".png")
+    ggsave(file_name, plot = p_m, width = 7.5, height = 4.2, dpi = 300)
+  }
+}
+
+plot_combined_dot_ridge <- function(target_df, pathways_list, stats, db_label) {
+  target_df <- target_df %>%
+    mutate(
+      pathway_clean = gsub("^HALLMARK_|^GOBP_", "", pathway),
+      pathway_clean = gsub("_", " ", pathway_clean),
+      pathway_clean = str_wrap(pathway_clean, width = 25),
+      pathway_clean = fct_reorder(pathway_clean, NES)
+    )
+  
+  pathway_levels <- levels(target_df$pathway_clean)
+  
+  p_dot <- ggplot(target_df, aes(x = NES, y = pathway_clean)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray60") +
+    geom_point(aes(size = size, color = NES), alpha = 0.9) +
+    scale_color_gradient2(
+      low = "#084003", mid = "#FBFBF9", high = "#5C439D", midpoint = 0,
+      name = "NES"
+    ) +
+    scale_size_continuous(name = "Gene Set Size", range = c(3, 7)) +
+    facet_grid(group ~ ., scales = "free_y", space = "free_y") +
+    theme_classic(base_size = 11) +
+    labs(
+      title = "GSEA Enrichment (NES & Size)",
+      x     = "Normalized Enrichment Score (NES)",
+      y     = NULL
+    ) +
+    theme(
+      plot.title         = element_text(face = "bold", size = 11, hjust = 0),
+      axis.text.y        = element_text(size = 8.5, face = "bold"),
+      axis.title.x       = element_text(face = "bold", size = 9.5),
+      strip.background   = element_rect(fill = "#F2EFFB", color = "#5C439D"),
+      strip.text         = element_text(face = "bold", color = "#3A2272", size = 9),
+      panel.grid.major.y = element_line(color = "#F0F0F0")
+    )
+
+  ridge_data_list <- list()
+  for (i in seq_len(nrow(target_df))) {
+    pw_name  <- target_df$pathway[i]
+    pw_group <- target_df$group[i]
+    pw_genes <- intersect(pathways_list[[pw_name]], names(stats))
+    
+    if (length(pw_genes) > 0) {
+      clean_name <- gsub("^HALLMARK_|^GOBP_", "", pw_name)
+      clean_name <- gsub("_", " ", clean_name)
+      clean_name <- str_wrap(clean_name, width = 25)
+      
+      ridge_data_list[[i]] <- tibble(
+        pathway_clean = clean_name,
+        group         = pw_group,
+        stat          = stats[pw_genes]
+      )
+    }
+  }
+  
+  ridge_df <- bind_rows(ridge_data_list) %>%
+    mutate(pathway_clean = factor(pathway_clean, levels = pathway_levels))
+  
+  p_ridge <- ggplot(ridge_df, aes(x = stat, y = pathway_clean, fill = ..x..)) +
+    geom_density_ridges_gradient(scale = 1.2, rel_min_height = 0.01, color = "white", linewidth = 0.3) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+    scale_fill_gradient2(
+      low = "#084003", mid = "#FBFBF9", high = "#5C439D", midpoint = 0,
+      name = paste0("Rank Metric (", rank_col, ")")
+    ) +
+    facet_grid(group ~ ., scales = "free_y", space = "free_y") +
+    theme_classic(base_size = 11) +
+    labs(
+      title = "Gene Metric Distribution",
+      x     = paste0("Ranking Statistic (", rank_col, ")"),
+      y     = NULL
+    ) +
+    theme(
+      plot.title         = element_text(face = "bold", size = 11, hjust = 0),
+      axis.text.y        = element_blank(),
+      axis.ticks.y       = element_blank(),
+      axis.title.x       = element_text(face = "bold", size = 9.5),
+      strip.background   = element_blank(),
+      strip.text         = element_blank(),
+      panel.grid.major.y = element_line(color = "#F0F0F0")
+    )
+
+  cowplot::plot_grid(
+    p_dot, p_ridge,
+    ncol       = 2,
+    rel_widths = c(1.4, 1.0),
+    align      = "h",
+    axis       = "tb"
+  )
+}
+
+# Function 3: Differential Expression Volcano Plot (2-Fold, Raw P < 0.01, Top 5 Labeled)
+plot_volcano <- function(de_df, 
+                         logfc_col = "logFC", 
+                         pval_col = "P.Value",      # Uses raw P-value
+                         lfc_cutoff = 1.0,          # 2-fold change (log2(2) = 1.0)
+                         p_cutoff = 0.01,           # Raw P < 0.01
+                         top_n_label = 5) {         # Labels top 5 per side
+  
+  if (!logfc_col %in% colnames(de_df)) {
+    logfc_col <- intersect(c("logFC", "log2FC"), colnames(de_df))[1]
+  }
+  if (!pval_col %in% colnames(de_df)) {
+    pval_col <- intersect(c("P.Value", "p.value", "adj.P.Val"), colnames(de_df))[1]
+  }
+  
+  v_df <- de_df %>%
+    filter(!is.na(.data[[logfc_col]]), !is.na(.data[[pval_col]])) %>%
+    mutate(
+      neg_log10_p = -log10(.data[[pval_col]]),
+      status = case_when(
+        .data[[pval_col]] < p_cutoff & .data[[logfc_col]] >= lfc_cutoff  ~ "Up",
+        .data[[pval_col]] < p_cutoff & .data[[logfc_col]] <= -lfc_cutoff ~ "Down",
+        TRUE                                                             ~ "Not Sig"
+      ),
+      status = factor(status, levels = c("Up", "Down", "Not Sig"))
+    )
+  
+  top_up <- v_df %>%
+    filter(status == "Up") %>%
+    slice_min(order_by = .data[[pval_col]], n = top_n_label, with_ties = FALSE)
+  
+  top_down <- v_df %>%
+    filter(status == "Down") %>%
+    slice_min(order_by = .data[[pval_col]], n = top_n_label, with_ties = FALSE)
+  
+  labeled_genes <- bind_rows(top_up, top_down)
+  
+  n_up   <- sum(v_df$status == "Up")
+  n_down <- sum(v_df$status == "Down")
+  message(sprintf("Volcano Plot Highlights: %d Upregulated | %d Downregulated (Raw P < %.2f, |log2FC| >= %.1f)",
+                  n_up, n_down, p_cutoff, lfc_cutoff))
+  
+  ggplot(v_df, aes(x = .data[[logfc_col]], y = neg_log10_p)) +
+    geom_point(aes(color = status), alpha = 0.6, size = 1.5) +
+    geom_point(data = labeled_genes, aes(x = .data[[logfc_col]], y = neg_log10_p, color = status),
+               size = 2.2, shape = 21, stroke = 0.8, fill = NA) +
+    geom_vline(xintercept = c(-lfc_cutoff, lfc_cutoff), linetype = "dashed", color = "gray50", linewidth = 0.4) +
+    geom_hline(yintercept = -log10(p_cutoff), linetype = "dashed", color = "gray50", linewidth = 0.4) +
+    geom_text_repel(
+      data = labeled_genes,
+      aes(label = gene_name),
+      size = 3.2,
+      fontface = "bold.italic",
+      box.padding = 0.5,
+      point.padding = 0.3,
+      segment.color = "gray40",
+      segment.size = 0.3,
+      max.overlaps = Inf
+    ) +
+    scale_color_manual(
+      values = c("Up" = "#5C439D", "Down" = "#084003", "Not Sig" = "#B0BEC5"),
+      labels = c("Up" = "Up", "Down" = "Down", "Not Sig" = "Not Significant")
+    ) +
+    theme_classic(base_size = 11) +
+    labs(
+      title = "Volcano Plot: Nominal Differential Expression",
+      subtitle = sprintf("Cutoffs: Raw P < %.2f, |FC| >= 2.0 (log2FC >= 1.0)", p_cutoff),
+      x     = "Log2 Fold Change",
+      y     = "-Log10 Raw P-value",
+      color = "Expression Status"
+    ) +
+    theme(
+      plot.title      = element_text(face = "bold", size = 12, hjust = 0.5),
+      plot.subtitle   = element_text(size = 9.5, hjust = 0.5, face = "italic"),
+      axis.title      = element_text(face = "bold", size = 10),
+      legend.position = "top",
+      legend.title    = element_text(face = "bold", size = 9)
+    )
+}
+
+# ------------------------------------------------------------------------------
+# STEP 7: Generate & Save All Plots
+# ------------------------------------------------------------------------------
+p_dot_hallmark <- plot_gsea_dotplot(gsea_hallmark, "MSigDB Hallmark")
+ggsave("Exp2_Unbiased_GSEA_Hallmark_DotPlot.png", plot = p_dot_hallmark, width = 8, height = 6.5, dpi = 300)
+
+p_dot_gobp <- plot_gsea_dotplot(gsea_gobp, "MSigDB GO:BP")
+ggsave("Exp2_Unbiased_GSEA_GOBP_DotPlot.png", plot = p_dot_gobp, width = 9, height = 7.5, dpi = 300)
+
+if (nrow(target_hallmark_df) > 0) {
+  p_hallmark_target_dot <- plot_target_dotplot(target_hallmark_df, "MSigDB Hallmark")
+  ggsave("Exp2_Top15_Hallmark_DotPlot.png", plot = p_hallmark_target_dot, width = 9, height = 7.5, dpi = 300)
+
+  p_hallmark_target_ridge <- plot_target_ridge(target_hallmark_df, hs_hallmark, stats_vector, "MSigDB Hallmark")
+  ggsave("Exp2_Top15_Hallmark_RidgePlot.png", plot = p_hallmark_target_ridge, width = 9, height = 7.5, dpi = 300)
+
+  p_hallmark_comb <- plot_combined_dot_ridge(target_hallmark_df, hs_hallmark, stats_vector, "MSigDB Hallmark")
+  ggsave("Exp2_Top15_Hallmark_Combined_Dot_Ridge.png", plot = p_hallmark_comb, width = 12, height = 8.5, dpi = 300)
+
+  save_targeted_mountain_plots(target_hallmark_df, hs_hallmark, stats_vector, "Hallmark")
+} else {
+  message("No Hallmark pathways passed the threshold (padj < 0.05).")
+}
+
+if (nrow(target_gobp_df) > 0) {
+  p_gobp_target_dot <- plot_target_dotplot(target_gobp_df, "MSigDB GO:BP")
+  ggsave("Exp2_Top15_GOBP_DotPlot.png", plot = p_gobp_target_dot, width = 9, height = 8.5, dpi = 300)
+
+  p_gobp_target_ridge <- plot_target_ridge(target_gobp_df, hs_gobp, stats_vector, "MSigDB GO:BP")
+  ggsave("Exp2_Top15_GOBP_RidgePlot.png", plot = p_gobp_target_ridge, width = 9, height = 8.5, dpi = 300)
+
+  p_gobp_comb <- plot_combined_dot_ridge(target_gobp_df, hs_gobp, stats_vector, "MSigDB GO:BP")
+  ggsave("Exp2_Top15_GOBP_Combined_Dot_Ridge.png", plot = p_gobp_comb, width = 12, height = 9.5, dpi = 300)
+
+  save_targeted_mountain_plots(target_gobp_df, hs_gobp, stats_vector, "GOBP")
+} else {
+  message("No GO:BP pathways passed the threshold (padj < 0.05).")
+}
+
+# Generate Volcano Plot
+p_volcano <- plot_volcano(
+  de_df       = de_results_full, 
+  logfc_col   = "logFC", 
+  pval_col    = "P.Value",   # Raw P-value
+  lfc_cutoff  = 1.0,         # 2-fold change
+  p_cutoff    = 0.01,        # Raw P < 0.01
+  top_n_label = 5            # Labels top 5 per side
+)
+
+ggsave("Exp2_DE_VolcanoPlot_2Fold_P001_Top5Labeled.png", plot = p_volcano, width = 7.0, height = 6.5, dpi = 300)
+
+message("PART 5 PIPELINE COMPLETE: Top 15 GSEA & Volcano Plot Saved Successfully.")
